@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
@@ -19,9 +19,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Définition des chemins des fichiers Excel
+UPLOAD_FOLDER = 'uploads'
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
 FILE_PATHS = {
-    'compatibility': r"C:\Users\ADMIN\Desktop\Python\PARTS_COMPATIBILITY_REPORT.xlsx",
-    'stock': r"C:\Users\ADMIN\Desktop\Python\Stock.xlsx"
+    'compatibility': os.path.join(UPLOAD_FOLDER, 'PARTS_COMPATIBILITY_REPORT.xlsx'),
+    'stock': os.path.join(UPLOAD_FOLDER, 'Stock.xlsx')
 }
 
 # Fonction pour remplacer les NaN par None dans les DataFrames
@@ -31,25 +35,49 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     return df.replace({np.nan: None})
 
+# Fonction pour remplacer les NaN par None dans les structures de données
+def replace_nan(data: Union[dict, list, float]) -> Union[dict, list, None]:
+    """
+    Remplace les valeurs NaN par None pour éviter les problèmes de sérialisation JSON.
+    """
+    if isinstance(data, dict):
+        return {k: replace_nan(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [replace_nan(item) for item in data]
+    elif isinstance(data, float) and np.isnan(data):
+        return None
+    return data
+
 # Chargement des fichiers Excel en DataFrames pandas
 def load_data(file_paths: Dict[str, str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Charge les fichiers Excel et nettoie les données.
+    Si les fichiers n'existent pas, crée des DataFrames vides.
     """
-    for path in file_paths.values():
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Fichier Excel introuvable : {path}")
+    dfs = {}
+    for key, path in file_paths.items():
+        if os.path.exists(path):
+            dfs[key] = pd.read_excel(path)
+        else:
+            # Crée un DataFrame vide avec les colonnes nécessaires
+            if key == 'compatibility':
+                dfs[key] = pd.DataFrame(columns=['PLATFORM', 'PART NUMBER', 'SUBS NUMBER'])
+            elif key == 'stock':
+                dfs[key] = pd.DataFrame(columns=['AR_Ref', 'AR_Design', 'DE_Intitule'])
+            logger.warning(f"Fichier Excel introuvable : {path}. Un DataFrame vide a été créé.")
 
-    df1 = pd.read_excel(file_paths['compatibility'])
-    df2 = pd.read_excel(file_paths['stock'])
+    df1 = dfs.get('compatibility', pd.DataFrame())
+    df2 = dfs.get('stock', pd.DataFrame())
 
     # Nettoyage et normalisation des colonnes
-    df1 = df1.dropna(subset=['PLATFORM'])  # Supprime les lignes avec PLATFORM vide
-    df1['PLATFORM'] = df1['PLATFORM'].str.lower().str.strip()
-    df1['PART NUMBER'] = df1['PART NUMBER'].astype(str).str.strip()
+    if not df1.empty:
+        df1 = df1.dropna(subset=['PLATFORM'])  # Supprime les lignes avec PLATFORM vide
+        df1['PLATFORM'] = df1['PLATFORM'].str.lower().str.strip()
+        df1['PART NUMBER'] = df1['PART NUMBER'].astype(str).str.strip()
 
-    df2['AR_Ref'] = df2['AR_Ref'].astype(str).str.strip()
-    df2['AR_Design'] = df2['AR_Design'].astype(str).str.strip()
+    if not df2.empty:
+        df2['AR_Ref'] = df2['AR_Ref'].astype(str).str.strip()
+        df2['AR_Design'] = df2['AR_Design'].astype(str).str.strip()
 
     # Vérification des colonnes requises dans df2
     required_columns = {'AR_Ref', 'AR_Design', 'DE_Intitule'}
@@ -68,28 +96,88 @@ try:
     df1, df2 = load_data(FILE_PATHS)
 except Exception as e:
     logger.error(f"Erreur lors du chargement des fichiers Excel: {e}")
-    raise
+    df1, df2 = pd.DataFrame(), pd.DataFrame()  # Crée des DataFrames vides en cas d'erreur
 
-# Fonction pour remplacer les NaN par None dans les structures de données
-def replace_nan(data: Union[dict, list, float]) -> Union[dict, list, None]:
+# Route pour importer un fichier Excel
+@app.route('/upload', methods=['POST'])
+def upload_file():
     """
-    Remplace les valeurs NaN par None pour éviter les problèmes de sérialisation JSON.
+    Importe un fichier Excel et le sauvegarde dans le dossier uploads.
     """
-    if isinstance(data, dict):
-        return {k: replace_nan(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [replace_nan(item) for item in data]
-    elif isinstance(data, float) and np.isnan(data):
-        return None
-    return data
+    if 'file' not in request.files:
+        return jsonify({"message": "Aucun fichier fourni"}), 400
 
-# Fonction pour trouver des correspondances approximatives avec RapidFuzz
-def improved_fuzzy_match(query: str, choices: List[str], limit: int = 3) -> List[tuple[str, float]]:
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"message": "Aucun fichier sélectionné"}), 400
+
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
+
+    # Mettre à jour les chemins des fichiers
+    if 'PARTS_COMPATIBILITY_REPORT' in file.filename:
+        FILE_PATHS['compatibility'] = file_path
+    elif 'Stock' in file.filename:
+        FILE_PATHS['stock'] = file_path
+
+    # Recharger les données après l'importation
+    global df1, df2
+    try:
+        df1, df2 = load_data(FILE_PATHS)
+    except Exception as e:
+        logger.error(f"Erreur lors du rechargement des fichiers Excel: {e}")
+        return jsonify({"message": "Erreur lors du rechargement des fichiers Excel"}), 500
+
+    return jsonify({"message": "Fichier importé avec succès", "file_path": file_path}), 200
+
+# Route pour supprimer un fichier Excel
+@app.route('/delete', methods=['POST'])
+def delete_file():
     """
-    Trouve des correspondances approximatives pour une requête donnée en utilisant RapidFuzz.
+    Supprime un fichier Excel du dossier uploads.
     """
-    matches = process.extract(query, choices, scorer=fuzz.token_sort_ratio, limit=limit)
-    return [(match[0], match[1] / 100) for match in matches]  # Normalisation du score entre 0 et 1
+    data = request.get_json()
+    if not data or 'file_path' not in data:
+        return jsonify({"message": "Aucun chemin de fichier fourni"}), 400
+
+    file_path = data['file_path']
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        return jsonify({"message": "Fichier supprimé avec succès"}), 200
+    else:
+        return jsonify({"message": "Fichier introuvable"}), 404
+
+# Route pour mettre à jour les fichiers Excel
+@app.route('/update-files', methods=['POST'])
+def update_files():
+    """
+    Met à jour les fichiers Excel en les remplaçant par de nouveaux fichiers.
+    """
+    if 'file' not in request.files:
+        return jsonify({"message": "Aucun fichier fourni"}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"message": "Aucun fichier sélectionné"}), 400
+
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
+
+    # Mettre à jour les chemins des fichiers
+    if 'PARTS_COMPATIBILITY_REPORT' in file.filename:
+        FILE_PATHS['compatibility'] = file_path
+    elif 'Stock' in file.filename:
+        FILE_PATHS['stock'] = file_path
+
+    # Recharger les données après la mise à jour
+    global df1, df2
+    try:
+        df1, df2 = load_data(FILE_PATHS)
+    except Exception as e:
+        logger.error(f"Erreur lors du rechargement des fichiers Excel: {e}")
+        return jsonify({"message": "Erreur lors du rechargement des fichiers Excel"}), 500
+
+    return jsonify({"message": "Fichiers mis à jour avec succès", "file_path": file_path}), 200
 
 # Route pour vérifier si l'API fonctionne
 @app.route('/health', methods=['GET'])
@@ -98,6 +186,14 @@ def health_check():
     Vérifie que l'API est fonctionnelle.
     """
     return jsonify({"status": "ok"}), 200
+
+# Fonction pour trouver des correspondances approximatives avec RapidFuzz
+def improved_fuzzy_match(query: str, choices: List[str], limit: int = 3) -> List[tuple[str, float]]:
+    """
+    Trouve des correspondances approximatives pour une requête donnée en utilisant RapidFuzz.
+    """
+    matches = process.extract(query, choices, scorer=fuzz.token_sort_ratio, limit=limit)
+    return [(match[0], match[1] / 100) for match in matches]  # Normalisation du score entre 0 et 1
 
 # Route de recherche
 @app.route('/search', methods=['POST'])
